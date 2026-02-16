@@ -2,31 +2,46 @@
 """
 stock_news_predictor.py
 
-Python GUI app that fetches company news from public RSS sources (no Yahoo news query)
-plus recent prices, then visualizes a lightweight news/price based forecast for a stock ticker.
+Python GUI app that fetches company news via Finnhub API
+plus recent prices via yfinance, then visualizes a lightweight news/price based forecast.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
 import statistics
 import ssl
 from datetime import datetime, timezone, timedelta
-from html import unescape
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 
 import threading
 import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
-USER_AGENT = "Mozilla/5.0 (compatible; StockNewsPredictor/1.1)"
-NEWS_CRAWLING_ENABLED = False
+import yfinance as yf
+
+USER_AGENT = "Mozilla/5.0 (compatible; StockNewsPredictor/2.0)"
+
+def _load_env():
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+_load_env()
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 POSITIVE = {
     "beat": 2,
@@ -92,7 +107,6 @@ def _open_url(url: str, timeout: int = 20) -> bytes:
         with urlopen(req, timeout=timeout) as response:
             return response.read()
     except (ssl.SSLError, URLError):
-        # macOS Python/CA 번들 문제 대응: 필요 시 보안 검증을 비활성화하고 한 번 재시도
         insecure_ctx = ssl._create_unverified_context()
         with urlopen(req, timeout=timeout, context=insecure_ctx) as response:
             return response.read()
@@ -100,64 +114,44 @@ def _open_url(url: str, timeout: int = 20) -> bytes:
 
 def fetch_json(url: str, timeout: int = 20) -> Dict:
     text = _open_url(url, timeout=timeout).decode("utf-8", errors="ignore")
-    return __import__("json").loads(text)
+    return json.loads(text)
 
 
 def parse_price_data(symbol: str, period: str = "6mo") -> Dict:
-    url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{quote(symbol)}?interval=1d&range={quote(period)}&includeAdjustedClose=true"
-    )
-    payload = fetch_json(url)
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, interval="1d")
 
-    results = payload.get("chart", {}).get("result", []) if isinstance(payload, dict) else []
-    if not results:
+    if df.empty:
         raise RuntimeError("주가 데이터가 없습니다.")
 
-    result = results[0]
-    timestamps = result.get("timestamp", []) or []
-    indicators = result.get("indicators", {}).get("quote", [])
-    if not indicators:
-        raise RuntimeError("가격 지표가 없습니다.")
-
-    closes = indicators[0].get("close", []) or []
-    opens = indicators[0].get("open", []) or []
-    highs = indicators[0].get("high", []) or []
-    lows = indicators[0].get("low", []) or []
-    if not timestamps or not closes:
-        raise RuntimeError("종가 데이터가 비어 있습니다.")
-
     rows: List[Tuple[datetime, float, float, float, float]] = []
-    for i, ts in enumerate(timestamps):
-        if i >= len(closes):
-            break
-
-        close = closes[i]
-        if close is None:
+    for idx, row in df.iterrows():
+        dt = idx.to_pydatetime()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        close = float(row["Close"])
+        open_price = float(row["Open"])
+        high_price = float(row["High"])
+        low_price = float(row["Low"])
+        if any(math.isnan(v) for v in (close, open_price, high_price, low_price)):
             continue
-
-        open_price = opens[i] if i < len(opens) and opens[i] is not None else close
-        high_price = highs[i] if i < len(highs) and highs[i] is not None else close
-        low_price = lows[i] if i < len(lows) and lows[i] is not None else close
-        if open_price is None or high_price is None or low_price is None:
-            continue
-        try:
-            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        except Exception:
-            continue
-        rows.append((dt, float(close), float(open_price), float(high_price), float(low_price)))
+        rows.append((dt, close, open_price, high_price, low_price))
 
     if not rows:
         raise RuntimeError("유효한 가격 데이터가 없습니다.")
 
-    meta = result.get("meta", {}) or {}
+    try:
+        info = ticker.info
+    except Exception:
+        info = {}
+
     return {
         "rows": rows,
-        "symbol": meta.get("symbol", symbol),
-        "name": meta.get("longName") or meta.get("shortName") or symbol,
-        "currency": meta.get("currency", "USD"),
-        "exchange": meta.get("exchangeName", "N/A"),
-        "current_price": float(meta.get("regularMarketPrice") or rows[-1][1]),
+        "symbol": info.get("symbol", symbol),
+        "name": info.get("longName") or info.get("shortName") or symbol,
+        "currency": info.get("currency", "USD"),
+        "exchange": info.get("exchange", "N/A"),
+        "current_price": float(info.get("regularMarketPrice") or info.get("currentPrice") or rows[-1][1]),
     }
 
 
@@ -232,27 +226,24 @@ def resolve_symbol_by_name(query: str) -> str:
     if not q:
         raise RuntimeError("종목명/티커를 입력해주세요.")
 
-    url = (
-        "https://query2.finance.yahoo.com/v1/finance/search?"
-        f"q={quote(q)}&quotesCount=10&newsCount=0&listsCount=0"
-    )
+    # 티커처럼 보이면 yfinance로 직접 검증
     if _looks_like_ticker(q):
         candidate = q.upper()
         try:
-            payload = fetch_json(url)
-            if isinstance(payload, dict):
-                for item in payload.get("quotes", []) or []:
-                    if isinstance(item, dict) and (item.get("symbol") or "").upper() == candidate:
-                        return candidate
+            ticker = yf.Ticker(candidate)
+            hist = ticker.history(period="5d")
+            if not hist.empty:
+                return candidate
         except Exception:
-            # fallback to full search logic below
             pass
 
-    payload = fetch_json(url)
-    if not isinstance(payload, dict):
-        raise RuntimeError("검색 응답 형식이 올바르지 않습니다.")
+    # yfinance Search 사용
+    try:
+        search = yf.Search(q, max_results=10, news_count=0)
+        quotes = search.quotes if hasattr(search, "quotes") else []
+    except Exception:
+        quotes = []
 
-    quotes = payload.get("quotes", [])
     if not quotes:
         raise RuntimeError(f"입력값 '{q}'에 해당하는 종목을 찾지 못했습니다.")
 
@@ -308,127 +299,63 @@ def _add_trading_days(base_date: datetime, count: int) -> datetime:
     return dt
 
 
-def _strip_html(text: str) -> str:
-    clean = re.sub(r"<[^>]*?>", " ", unescape(text or ""))
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
+def fetch_news(symbol: str, limit: int = 20) -> List[Dict]:
+    """Finnhub API를 통해 종목 관련 뉴스를 가져옵니다."""
+    if not FINNHUB_API_KEY:
+        return []
 
+    today = datetime.now(tz=timezone.utc)
+    from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    to_date = today.strftime("%Y-%m-%d")
 
-def _first_text(node: ET.Element, names: List[str]) -> str:
-    for name in names:
-        child = node.find(name)
-        if child is not None and isinstance(child.text, str) and child.text.strip():
-            return child.text.strip()
-        if child is not None and isinstance(child.text, str):
-            return child.text.strip()
-    return ""
+    url = (
+        f"https://finnhub.io/api/v1/company-news"
+        f"?symbol={quote(symbol)}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
+    )
 
+    try:
+        data = fetch_json(url)
+    except Exception as exc:
+        raise RuntimeError(f"Finnhub 뉴스 수집 실패: {exc}")
 
-def _extract_rss_items(url: str, provider: str, limit: int) -> List[Dict]:
-    xml_raw = _open_url(url, timeout=25).decode("utf-8", errors="ignore")
+    if not isinstance(data, list):
+        return []
 
-    root = ET.fromstring(xml_raw)
-    items = root.findall(".//item")
-    if not items:
-        items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+    collected: List[Dict] = []
+    dedup: set = set()
 
-    parsed: List[Dict] = []
-    for node in items:
-        title = _strip_html(_first_text(node, ["title", "{http://www.w3.org/2005/Atom}title"]))
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("headline") or "").strip()
         if not title:
             continue
 
-        link = _first_text(node, ["link", "{http://www.w3.org/2005/Atom}link"])
-        if not link:
-            for link_node in node.findall("link") + node.findall("{http://www.w3.org/2005/Atom}link"):
-                if not isinstance(link_node.tag, str):
-                    continue
-                if link_node.text:
-                    link = link_node.text.strip()
-                    break
-                href = link_node.attrib.get("href") if hasattr(link_node, "attrib") else None
-                if href:
-                    link = href.strip()
-                    break
+        link = (item.get("url") or "").strip()
+        key = link or title
+        if key in dedup:
+            continue
+        dedup.add(key)
 
-        summary = _strip_html(
-            _first_text(node, ["description", "{http://www.w3.org/2005/Atom}summary"]) or ""
-        )
-        pub = _coerce_datetime(
-            _first_text(node, ["pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"])
-        )
+        pub = _coerce_datetime(item.get("datetime"))
+        summary = (item.get("summary") or "").strip()
+        provider = (item.get("source") or "unknown").strip()
 
-        source = _first_text(node, ["source", "{http://www.w3.org/2005/Atom}source"])
-        if not source:
-            source = provider
+        collected.append({
+            "title": title,
+            "link": link,
+            "summary": summary,
+            "provider": provider,
+            "published": pub,
+        })
 
-        parsed.append(
-            {
-                "title": title,
-                "link": link,
-                "summary": summary,
-                "provider": source,
-                "published": pub,
-            }
-        )
-
-        if len(parsed) >= limit:
-            break
-
-    return parsed
-
-
-def fetch_news(symbol: str, limit: int = 20) -> List[Dict]:
-    # 뉴스 크롤링은 현재 비활성화됨: 차단 이슈 방지를 위해 임시 중단
-    if not NEWS_CRAWLING_ENABLED:
-        return []
-
-    queries = [
-        f"{symbol} stock",
-        f"{symbol} company",
-        f"{symbol}",
-    ]
-    providers = [
-        (
-            "Google News",
-            lambda q: f"https://news.google.com/rss/search?q={quote(q)}&hl=ko&gl=KR&ceid=KR:ko",
-        ),
-        (
-            "Bing News",
-            lambda q: f"https://www.bing.com/news/search?q={quote(q)}&format=rss",
-        ),
-    ]
-
-    collected: List[Dict] = []
-    dedup = set()
-    last_error: Optional[Exception] = None
-
-    for q in queries:
-        for provider, builder in providers:
-            try:
-                crawled = _extract_rss_items(builder(q), provider, limit)
-            except Exception as exc:  # pragma: no cover
-                last_error = exc
-                continue
-
-            for item in crawled:
-                key = (item.get("link") or item.get("title") or "").strip()
-                if not key or key in dedup:
-                    continue
-                dedup.add(key)
-                item["provider"] = provider if not item.get("provider") else item["provider"]
-                collected.append(item)
-
-            if len(collected) >= limit:
-                break
         if len(collected) >= limit:
             break
 
-    if not collected:
-        err = f"{last_error}" if last_error else "no item parsed"
-        raise RuntimeError(f"뉴스 수집에 실패했습니다: {err}")
-
-    collected.sort(key=lambda n: n["published"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    collected.sort(
+        key=lambda n: n["published"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
     return collected[:limit]
 
 
@@ -520,14 +447,14 @@ def build_analysis(symbol: str, horizon: int, news_limit: int, period: str) -> D
     news = fetch_news(symbol, limit=news_limit)
     sentiment, per_item_scores = sentiment_score(news)
 
-    if NEWS_CRAWLING_ENABLED and news:
+    if news:
         sentiment_label = "중립"
         if sentiment > 0.12:
             sentiment_label = "긍정"
         elif sentiment < -0.12:
             sentiment_label = "부정"
     else:
-        sentiment_label = "중립(미적용)"
+        sentiment_label = "중립(뉴스없음)"
 
     trend_pct = linear_forecast(prices, horizon)
     sentiment_adj = sentiment * min(max(horizon, 1) / 7.0, 2.5) * 2.2
@@ -588,7 +515,7 @@ def build_analysis(symbol: str, horizon: int, news_limit: int, period: str) -> D
         "confidence": confidence,
         "news_count": len(news),
         "news_items": news_preview,
-        "news_enabled": NEWS_CRAWLING_ENABLED,
+        "news_enabled": len(news) > 0,
     }
 
 
